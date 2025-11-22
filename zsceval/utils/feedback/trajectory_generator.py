@@ -52,10 +52,14 @@ class TrajectoryGenerator:
             args: Configuration arguments (needed for buffer creation)
         """
         self.env = env
-        self.trainer = trainer_list
-        self.num_agents = len(trainer_list)
+        self.trainer = trainer_list  # List of trainers, one per agent
+        self.num_agents = len(trainer_list)  # Number of agents (should be 2 for Overcooked)
         self.layout_name = layout_name
         self.args = args
+        
+        # Verify we have the correct number of agents
+        if self.num_agents != 2:
+            logger.warning(f"Expected 2 agents for Overcooked, got {self.num_agents}")
         
         # Trajectory exporter (for frontend JSONs)
         self.exporter = TrajectoryExporter(
@@ -100,6 +104,7 @@ class TrajectoryGenerator:
             return False
         
         logger.info(f"Loading {self.num_agents} agent checkpoints and creating trainers...")
+        logger.info(f"  Checkpoint paths: {checkpoint_paths}")
         
         # Create new trainer list (wrapping policies with R_MAPPO)
         new_trainers = []
@@ -108,7 +113,7 @@ class TrajectoryGenerator:
             ckpt_path = Path(checkpoint_paths[agent_id])
             
             if not ckpt_path.exists():
-                logger.error(f"Checkpoint not found: {ckpt_path}")
+                logger.error(f"Checkpoint not found for agent {agent_id}: {ckpt_path}")
                 return False
             
             try:
@@ -126,13 +131,15 @@ class TrajectoryGenerator:
                     critic_state_dict = torch.load(critic_path, map_location=device, weights_only=False)
                     policy.critic.load_state_dict(critic_state_dict)
                     policy.critic.eval()
-                    logger.info(f"  Agent {agent_id}: Loaded actor + critic from {ckpt_path.name}")
+                    logger.info(f"  ✓ Agent {agent_id}: Loaded actor + critic from {ckpt_path.name}")
                 else:
-                    logger.info(f"  Agent {agent_id}: Loaded actor from {ckpt_path.name}")
+                    logger.info(f"  ✓ Agent {agent_id}: Loaded actor from {ckpt_path.name}")
                 
                 # Wrap policy with R_MAPPO trainer (includes value_normalizer)
                 trainer = R_MAPPO(self.args, policy, device=torch.device(device))
                 new_trainers.append(trainer)
+                
+                logger.debug(f"  Agent {agent_id}: Trainer created successfully")
                 
             except Exception as e:
                 logger.error(f"Failed to load checkpoint for agent {agent_id}: {e}")
@@ -143,7 +150,8 @@ class TrajectoryGenerator:
         # Replace policy list with trainer list
         self.trainer = new_trainers
         
-        logger.info("✓ All checkpoints loaded with trainers (includes value_normalizer)")
+        logger.info(f"✓ All {len(new_trainers)} checkpoints loaded with trainers (includes value_normalizer)")
+        logger.info(f"  Trainer list length: {len(self.trainer)}, num_agents: {self.num_agents}")
         return True
     
     def generate_trajectory(
@@ -351,6 +359,12 @@ class TrajectoryGenerator:
     ) -> Optional[Dict[str, str]]:
         """Generate trajectory, save buffer AND export JSON.
         
+        This method follows the same pattern as post-hoc-eval.ipynb:
+        - Uses ShareDummyVecEnv or ShareSubprocDummyBatchVecEnv wrapped environment
+        - Uses trainer.policy.act() for action selection (not get_actions())
+        - Extracts observations from info['all_agent_obs']
+        - Matches the exact evaluation workflow
+        
         This is the main method for offline HIL workflow:
         1. Creates HILRolloutBuffers for each agent
         2. Runs rollout and fills buffers with full training data
@@ -369,12 +383,12 @@ class TrajectoryGenerator:
             logger.error("Cannot create buffers without args. Pass args to __init__.")
             return None
         
-        # Validate n_rollout_threads
-        if hasattr(self.args, 'n_rollout_threads') and self.args.n_rollout_threads != 1:
-            raise ValueError(
-                f"HIL trajectory generation requires n_rollout_threads=1, "
-                f"got {self.args.n_rollout_threads}. "
-                f"Buffer is saved per-episode for human annotation."
+        # Validate n_rollout_threads (should be 1 for HIL, but we support VecEnv format)
+        n_rollout_threads = getattr(self.args, 'n_rollout_threads', 1)
+        if n_rollout_threads != 1:
+            logger.warning(
+                f"HIL trajectory generation typically uses n_rollout_threads=1, "
+                f"got {n_rollout_threads}. Using VecEnv format."
             )
         
         try:
@@ -391,161 +405,183 @@ class TrajectoryGenerator:
                 )
                 buffers.append(buffer)
             
-            # Initialize environment
-            reset_output = self.env.reset()
+            # Initialize environment (VecEnv format: returns (obs_batch, info_list))
+            eval_obs_batch, eval_info_list = self.env.reset()
             
-            # Overcooked env returns: (current_agent_obs, info)
-            # We need all_agent_obs from info
-            if isinstance(reset_output, tuple) and len(reset_output) == 2:
-                current_agent_obs, info = reset_output
-                
-                # Extract all agent observations from info
-                if 'all_agent_obs' in info:
-                    obs = info['all_agent_obs']  # Shape: (num_agents, H, W, C)
-                else:
-                    # Fallback: use current_agent_obs for all (not ideal)
-                    obs = np.array([current_agent_obs] * self.num_agents)
-                
-                # Extract share_obs
-                if 'share_obs' in info:
-                    share_obs = info['share_obs']  # Shape: (num_agents, H, W, C_share)
-                else:
-                    share_obs = obs
-                
-                # Extract available_actions
-                if 'available_actions' in info:
-                    available_actions = info['available_actions']
-                else:
-                    available_actions = None
-            else:
-                # Unexpected format
-                logger.warning(f"Unexpected reset output format: {type(reset_output)}")
-                obs = reset_output if isinstance(reset_output, np.ndarray) else np.array(reset_output)
-                share_obs = obs
-                available_actions = None
+            # Extract all_agent_obs from info_list (same as post-hoc-eval.ipynb)
+            # info['all_agent_obs'] shape: (num_agents, H, W, C)
+            # After np.array([...]): (n_rollout_threads, num_agents, H, W, C)
+            eval_obs = np.array([info['all_agent_obs'] for info in eval_info_list])
+            # eval_obs shape: (n_rollout_threads, num_agents, H, W, C)
+            # For n_rollout_threads=1: (1, num_agents, H, W, C)
             
-            logger.debug(f"After reset: obs.shape={obs.shape}, share_obs.shape={share_obs.shape if isinstance(share_obs, np.ndarray) else 'N/A'}")
+            # Debug: Verify shape
+            logger.debug(f"After reset: eval_info_list length: {len(eval_info_list)}")
+            if len(eval_info_list) > 0:
+                logger.debug(f"  First info keys: {eval_info_list[0].keys()}")
+                if 'all_agent_obs' in eval_info_list[0]:
+                    logger.debug(f"  First info['all_agent_obs'].shape: {eval_info_list[0]['all_agent_obs'].shape}")
             
-            # Initialize RNN states
-            rnn_states = np.zeros(
-                (self.num_agents, self.args.recurrent_N, self.args.hidden_size),
+            # Verify eval_obs shape is correct
+            if eval_obs.shape[1] != self.num_agents:
+                logger.error(
+                    f"eval_obs shape mismatch! Expected (n_rollout_threads, {self.num_agents}, H, W, C), "
+                    f"got {eval_obs.shape}. This suggests only one agent's observations are being returned."
+                )
+                # Try to fix: if shape is (1, 1, H, W, C), we might need to check info structure
+                if eval_obs.shape[1] == 1 and self.num_agents == 2:
+                    logger.warning("Only one agent's observations found. Checking info structure...")
+                    # Check if we need to extract differently
+                    if len(eval_info_list) > 0 and 'all_agent_obs' in eval_info_list[0]:
+                        all_agent_obs = eval_info_list[0]['all_agent_obs']
+                        logger.debug(f"  Direct all_agent_obs.shape: {all_agent_obs.shape}")
+                        # If it's already (num_agents, H, W, C), we just need to add batch dim
+                        if len(all_agent_obs.shape) == 4 and all_agent_obs.shape[0] == self.num_agents:
+                            eval_obs = np.expand_dims(all_agent_obs, axis=0)
+                            logger.info(f"  Fixed eval_obs.shape to: {eval_obs.shape}")
+            
+            # Extract available_actions
+            eval_available_actions = np.array([info['available_actions'] for info in eval_info_list])
+            # eval_available_actions shape: (n_rollout_threads, num_agents, action_dim)
+            
+            logger.info(f"After reset: eval_obs.shape={eval_obs.shape}, eval_available_actions.shape={eval_available_actions.shape}")
+            logger.info(f"  Expected eval_obs shape: (1, {self.num_agents}, H, W, C)")
+            
+            # Initialize RNN states (same format as post-hoc-eval.ipynb)
+            # Shape: (n_rollout_threads, num_agents, recurrent_N, hidden_size)
+            eval_rnn_states = np.zeros(
+                (n_rollout_threads, self.num_agents, self.args.recurrent_N, self.args.hidden_size),
                 dtype=np.float32
             )
-            rnn_states_critic = np.zeros_like(rnn_states)
-            masks = np.ones((self.num_agents, 1), dtype=np.float32)
+            eval_masks = np.ones((n_rollout_threads, self.num_agents, 1), dtype=np.float32)
             
             # Collect sequences for JSON export
-            obs_sequence = [obs.copy()]
+            obs_sequence = [eval_obs[0].copy()]  # Use first rollout thread for JSON
             actions_sequence = []
             rewards_sequence = []
             
             # Rollout
             for step in range(episode_length):
-                # Collect actions from all agents
-                actions_list = []
-                values_list = []
-                action_log_probs_list = []
-                new_rnn_states = []
-                new_rnn_states_critic = []
+                eval_actions = []
                 
+                # Collect actions from all agents (same as post-hoc-eval.ipynb)
                 for agent_id in range(self.num_agents):
                     trainer = self.trainer[agent_id]
+                    trainer.prep_rollout()
                     
-                    # Prepare inputs
-                    obs_agent = obs[agent_id:agent_id+1]  # Shape: (1, H, W, C)
-                    share_obs_agent = share_obs[agent_id:agent_id+1] if isinstance(share_obs, np.ndarray) else obs_agent
-                    rnn_state = rnn_states[agent_id:agent_id+1]
-                    rnn_state_critic = rnn_states_critic[agent_id:agent_id+1]
-                    mask = masks[agent_id:agent_id+1]
-                    avail_actions = available_actions[agent_id:agent_id+1] if available_actions is not None else None
+                    # Use policy.act() (not get_actions()) - same as post-hoc-eval.ipynb
+                    eval_action, eval_rnn_state = trainer.policy.act(
+                        eval_obs[:, agent_id],  # Shape: (n_rollout_threads, H, W, C)
+                        eval_rnn_states[:, agent_id],  # Shape: (n_rollout_threads, recurrent_N, hidden_size)
+                        eval_masks[:, agent_id],  # Shape: (n_rollout_threads, 1)
+                        eval_available_actions[:, agent_id],  # Shape: (n_rollout_threads, action_dim)
+                        deterministic=deterministic
+                    )
                     
-                    # Get action
+                    eval_action = _t2n(eval_action)
+                    eval_actions.append(eval_action)
+                    eval_rnn_states[:, agent_id] = _t2n(eval_rnn_state)
+                    
+                    # Debug logging for first step to verify both agents are working
+                    if step == 0:
+                        logger.debug(f"Agent {agent_id} action shape: {eval_action.shape}, action value: {eval_action}")
+                
+                # Stack actions and transpose (same as post-hoc-eval.ipynb)
+                # eval_actions: list of (n_rollout_threads, action_dim)
+                # After stack: (num_agents, n_rollout_threads, action_dim)
+                # After transpose: (n_rollout_threads, num_agents, action_dim)
+                eval_actions = np.stack(eval_actions).transpose(1, 0, 2)
+                
+                # Debug logging for first step to verify both agents' actions are included
+                if step == 0:
+                    logger.info(f"Step {step}: eval_actions shape: {eval_actions.shape}, actions: {eval_actions[0]}")
+                    logger.info(f"  Agent 0 action: {eval_actions[0, 0]}, Agent 1 action: {eval_actions[0, 1] if self.num_agents > 1 else 'N/A'}")
+                
+                # Environment step (VecEnv format)
+                (
+                    _eval_obs_batch_single_agent,
+                    _,
+                    eval_rewards,
+                    eval_dones,
+                    eval_infos,
+                    eval_available_actions,
+                ) = self.env.step(eval_actions)
+                
+                # Extract all_agent_obs from info_list (same as post-hoc-eval.ipynb)
+                # info['all_agent_obs'] shape: (num_agents, H, W, C)
+                # After np.array([...]): (n_rollout_threads, num_agents, H, W, C)
+                eval_obs = np.array([info['all_agent_obs'] for info in eval_infos])
+                
+                # Verify shape is correct
+                if eval_obs.shape[1] != self.num_agents:
+                    logger.error(
+                        f"eval_obs shape mismatch at step {step}! Expected (n_rollout_threads, {self.num_agents}, H, W, C), "
+                        f"got {eval_obs.shape}"
+                    )
+                    # Try to fix if needed
+                    if eval_obs.shape[1] == 1 and self.num_agents == 2 and len(eval_infos) > 0:
+                        if 'all_agent_obs' in eval_infos[0]:
+                            all_agent_obs = eval_infos[0]['all_agent_obs']
+                            if len(all_agent_obs.shape) == 4 and all_agent_obs.shape[0] == self.num_agents:
+                                eval_obs = np.expand_dims(all_agent_obs, axis=0)
+                                logger.warning(f"  Fixed eval_obs.shape at step {step} to: {eval_obs.shape}")
+                
+                # Store for JSON export (use first rollout thread)
+                obs_sequence.append(eval_obs[0].copy())
+                actions_sequence.append(eval_actions[0].copy())  # (num_agents, action_dim)
+                rewards_sequence.append(eval_rewards[0].copy())  # (num_agents,)
+                
+                # Update RNN states and masks for done episodes
+                eval_rnn_states[eval_dones == True] = np.zeros(
+                    ((eval_dones == True).sum(), self.args.recurrent_N, self.args.hidden_size),
+                    dtype=np.float32,
+                )
+                eval_masks = np.ones((n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+                eval_masks[eval_dones == True] = np.zeros(((eval_dones == True).sum(), 1), dtype=np.float32)
+                
+                # Insert into buffers (for each agent, use first rollout thread)
+                for agent_id in range(self.num_agents):
+                    # Get share_obs (use centralized if available, else use obs)
+                    if hasattr(self.args, 'use_centralized_V') and self.args.use_centralized_V:
+                        # Extract share_obs from info if available
+                        share_obs_agent = np.array([info.get('share_obs', info['all_agent_obs'])[agent_id] for info in eval_infos])
+                    else:
+                        share_obs_agent = eval_obs[:, agent_id]
+                    
+                    # Get values using get_actions for buffer (needed for value estimation)
+                    trainer = self.trainer[agent_id]
                     with torch.no_grad():
-                        value, action, action_log_prob, rnn_state_new, rnn_state_critic_new = trainer.policy.get_actions(
-                            share_obs_agent,
-                            obs_agent,
-                            rnn_state,
-                            rnn_state_critic,
-                            mask,
-                            avail_actions,
+                        value, _, action_log_prob, rnn_state_new, rnn_state_critic_new = trainer.policy.get_actions(
+                            share_obs_agent[0:1],  # (1, H, W, C_share)
+                            eval_obs[0:1, agent_id],  # (1, H, W, C)
+                            eval_rnn_states[0:1, agent_id],  # (1, recurrent_N, hidden_size)
+                            eval_rnn_states[0:1, agent_id],  # Use same for critic (will be updated)
+                            eval_masks[0:1, agent_id],  # (1, 1)
+                            eval_available_actions[0:1, agent_id] if eval_available_actions is not None else None,
                             deterministic=deterministic
                         )
                     
-                    actions_list.append(_t2n(action))
-                    values_list.append(_t2n(value))
-                    action_log_probs_list.append(_t2n(action_log_prob))
-                    new_rnn_states.append(_t2n(rnn_state_new))
-                    new_rnn_states_critic.append(_t2n(rnn_state_critic_new))
-                
-                # Stack actions
-                actions = np.array(actions_list).squeeze(1)  # (num_agents, action_dim)
-                values = np.array(values_list).squeeze(1)
-                action_log_probs = np.array(action_log_probs_list).squeeze(1)
-                rnn_states = np.array(new_rnn_states).squeeze(1)
-                rnn_states_critic = np.array(new_rnn_states_critic).squeeze(1)
-                
-                # Environment step
-                # Overcooked returns: (obs, share_obs, rewards, dones, info, available_actions)
-                step_output = self.env.step(actions)
-                
-                if len(step_output) == 6:
-                    # Full Overcooked output
-                    next_obs, next_share_obs, rewards, dones, info, next_available_actions = step_output
-                elif len(step_output) == 5:
-                    # Without available_actions
-                    next_obs, next_share_obs, rewards, dones, info = step_output
-                    next_available_actions = None
-                elif len(step_output) == 4:
-                    # Standard gym (unlikely for Overcooked)
-                    next_obs, rewards, dones, info = step_output
-                    next_share_obs = next_obs
-                    next_available_actions = None
-                else:
-                    raise ValueError(f"Unexpected step output length: {len(step_output)}")
-                
-                # Convert to numpy arrays if needed
-                next_obs = np.array(next_obs) if not isinstance(next_obs, np.ndarray) else next_obs
-                next_share_obs = np.array(next_share_obs) if not isinstance(next_share_obs, np.ndarray) else next_share_obs
-                rewards = np.array(rewards) if not isinstance(rewards, np.ndarray) else rewards
-                dones = np.array(dones) if not isinstance(dones, np.ndarray) else dones
-                
-                # Debug: Print shapes
-                if step == 0:
-                    logger.debug(
-                        f"Step {step} shapes:\n"
-                        f"  next_obs: {next_obs.shape if isinstance(next_obs, np.ndarray) else type(next_obs)}\n"
-                        f"  next_share_obs: {next_share_obs.shape if isinstance(next_share_obs, np.ndarray) else type(next_share_obs)}\n"
-                        f"  rewards: {rewards.shape if isinstance(rewards, np.ndarray) else type(rewards)}\n"
-                        f"  dones: {dones.shape if isinstance(dones, np.ndarray) else type(dones)}"
-                    )
-                
-                # Insert into buffers
-                for agent_id in range(self.num_agents):
+                    value = _t2n(value)
+                    action_log_prob = _t2n(action_log_prob)
+                    rnn_state_new = _t2n(rnn_state_new)
+                    rnn_state_critic_new = _t2n(rnn_state_critic_new)
+                    
+                    # Insert into buffer
                     buffers[agent_id].insert(
-                        share_obs[agent_id:agent_id+1] if isinstance(share_obs, np.ndarray) else obs[agent_id:agent_id+1],
-                        obs[agent_id:agent_id+1],
-                        rnn_states[agent_id:agent_id+1],
-                        rnn_states_critic[agent_id:agent_id+1],
-                        actions[agent_id:agent_id+1],
-                        action_log_probs[agent_id:agent_id+1],
-                        values[agent_id:agent_id+1],
-                        rewards[agent_id:agent_id+1],
-                        masks[agent_id:agent_id+1],
-                        available_actions=available_actions[agent_id:agent_id+1] if available_actions is not None else None
+                        share_obs_agent[0:1],  # (1, H, W, C_share)
+                        eval_obs[0:1, agent_id],  # (1, H, W, C)
+                        rnn_state_new,  # (1, recurrent_N, hidden_size)
+                        rnn_state_critic_new,  # (1, recurrent_N, hidden_size)
+                        eval_actions[0:1, agent_id:agent_id+1],  # (1, action_dim)
+                        action_log_prob,  # (1,)
+                        value,  # (1,)
+                        eval_rewards[0:1, agent_id:agent_id+1],  # (1,)
+                        eval_masks[0:1, agent_id],  # (1, 1)
+                        available_actions=eval_available_actions[0:1, agent_id:agent_id+1] if eval_available_actions is not None else None
                     )
                 
-                # Store for JSON export
-                obs_sequence.append(next_obs.copy())
-                actions_sequence.append(actions.copy())
-                rewards_sequence.append(rewards.copy())
-                
-                # Update state
-                obs = next_obs
-                share_obs = next_share_obs
-                available_actions = next_available_actions
-                
-                # Check done
-                if dones.all():
+                # Check if done
+                if np.all(eval_dones):
                     logger.debug(f"Episode finished at step {step + 1}")
                     break
             
@@ -554,11 +590,17 @@ class TrajectoryGenerator:
             for agent_id in range(self.num_agents):
                 trainer = self.trainer[agent_id]
                 
+                # Get share_obs for final value estimation
+                if hasattr(self.args, 'use_centralized_V') and self.args.use_centralized_V:
+                    share_obs_agent = np.array([info.get('share_obs', info['all_agent_obs'])[agent_id] for info in eval_infos])
+                else:
+                    share_obs_agent = eval_obs[:, agent_id]
+                
                 with torch.no_grad():
                     next_value = trainer.policy.get_values(
-                        share_obs[agent_id:agent_id+1] if isinstance(share_obs, np.ndarray) else obs[agent_id:agent_id+1],
-                        rnn_states[agent_id:agent_id+1],
-                        masks[agent_id:agent_id+1]
+                        share_obs_agent[0:1],  # (1, H, W, C_share)
+                        eval_rnn_states[0:1, agent_id],  # (1, recurrent_N, hidden_size)
+                        eval_masks[0:1, agent_id]  # (1, 1)
                     )
                     next_value = _t2n(next_value)
                 
@@ -577,12 +619,20 @@ class TrajectoryGenerator:
             actions_array = np.array(actions_sequence)
             rewards_array = np.array(rewards_sequence)
             
+            # Use custom save_path if provided, otherwise use default naming
+            custom_save_path = getattr(self, '_custom_json_path', None)
+            if custom_save_path:
+                json_save_path = custom_save_path
+            else:
+                json_save_path = None  # Use default naming
+            
             json_path = self.exporter.export_from_raw_data(
                 obs_sequence=obs_array[:-1, 0],  # Remove last obs, use agent 0
                 actions_sequence=actions_array[:, 0],  # Agent 0 actions
                 rewards_sequence=rewards_array[:, 0],  # Agent 0 rewards
                 episode_id=episode_id,
-                env_info={"layoutName": self.layout_name}
+                env_info={"layoutName": self.layout_name},
+                save_path=json_save_path
             )
             
             logger.info(
