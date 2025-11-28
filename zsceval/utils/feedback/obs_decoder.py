@@ -318,7 +318,7 @@ class ObservationDecoder:
         return None
     
     def _decode_objects(self, obs: np.ndarray) -> List[Dict]:
-        """Decode objects (pots, dishes, onions) from observation.
+        """Decode objects (pots, dishes, onions, tomatoes) from observation.
         
         Args:
             obs: Observation array
@@ -337,8 +337,13 @@ class ObservationDecoder:
         dish_objects = self._decode_dishes(obs)
         objects.extend(dish_objects)
         
-        # Note: Onions/tomatoes in dispensers are not included as objects
-        # (they are considered part of the map)
+        # Decode onions on counters
+        onion_objects = self._decode_onions(obs)
+        objects.extend(onion_objects)
+        
+        # Decode tomatoes on counters
+        tomato_objects = self._decode_tomatoes(obs)
+        objects.extend(tomato_objects)
         
         return objects
     
@@ -453,6 +458,62 @@ class ObservationDecoder:
                 })
         
         return dishes
+    
+    def _decode_onions(self, obs: np.ndarray) -> List[Dict]:
+        """Decode onion objects from observation.
+        
+        Args:
+            obs: Observation array
+            
+        Returns:
+            List of onion objects
+        """
+        onions = []
+        H, W, C = obs.shape
+        
+        # Find onion layer (channel 22)
+        onion_channel = self.layer_idx['onions']
+        
+        if onion_channel < C:
+            onion_layer = obs[:, :, onion_channel]
+            onion_positions = np.argwhere(onion_layer > 0)
+            
+            for pos in onion_positions:
+                y, x = pos
+                onions.append({
+                    "name": "onion",
+                    "position": {"x": int(x), "y": int(y)}
+                })
+        
+        return onions
+    
+    def _decode_tomatoes(self, obs: np.ndarray) -> List[Dict]:
+        """Decode tomato objects from observation.
+        
+        Args:
+            obs: Observation array
+            
+        Returns:
+            List of tomato objects
+        """
+        tomatoes = []
+        H, W, C = obs.shape
+        
+        # Find tomato layer (channel 23)
+        tomato_channel = self.layer_idx['tomatoes']
+        
+        if tomato_channel < C:
+            tomato_layer = obs[:, :, tomato_channel]
+            tomato_positions = np.argwhere(tomato_layer > 0)
+            
+            for pos in tomato_positions:
+                y, x = pos
+                tomatoes.append({
+                    "name": "tomato",
+                    "position": {"x": int(x), "y": int(y)}
+                })
+        
+        return tomatoes
     
     def _action_to_name(self, actions: Optional[np.ndarray]) -> str:
         """Convert action index to name.
