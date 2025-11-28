@@ -142,16 +142,18 @@ class LazyVAEDataset(Dataset):
                 target_tensor = torch.from_numpy(target_seq).float()
                 
                 # 인코딩 타입에 따라 다른 처리
+                # Min-Max 정규화 함수 (0~1 범위로)
+                def normalize_to_01(tensor):
+                    """Min-Max 정규화: [0, 1] 범위로 변환"""
+                    min_val = tensor.min()
+                    max_val = tensor.max()
+                    if max_val > min_val:  # 0으로 나누기 방지
+                        return (tensor - min_val) / (max_val - min_val)
+                    else:
+                        return tensor  # 모든 값이 같으면 그대로
+                
                 if self.encoding in ['raw_image', 'OAI_raw_image']:
                     # Raw image: Min-Max 정규화 [0, 1] (BCE loss를 위해)
-                    def normalize_to_01(tensor):
-                        min_val = tensor.min()
-                        max_val = tensor.max()
-                        if max_val > min_val:  # 0으로 나누기 방지
-                            return (tensor - min_val) / (max_val - min_val)
-                        else:
-                            return tensor  # 모든 값이 같으면 그대로
-                    
                     input_tensor = normalize_to_01(input_tensor)
                     target_tensor = normalize_to_01(target_tensor)
                 elif self.encoding in ['OAI_lossless']:
@@ -161,7 +163,11 @@ class LazyVAEDataset(Dataset):
                         # (k+1, W, H, C) -> (k+1, C, H, W)
                         input_tensor = input_tensor.permute(0, 3, 2, 1)
                         target_tensor = target_tensor.permute(0, 3, 2, 1)
-                    # 정규화는 하지 않음 (lossless는 원본 값 사용)
+                    
+                    # Min-Max 정규화 추가 (0~1 범위로, BCE loss를 위해)
+                    # 전체 배치의 최대값으로 정규화 (채널별이 아닌 전체)
+                    input_tensor = normalize_to_01(input_tensor)
+                    target_tensor = normalize_to_01(target_tensor)
                 # 다른 인코딩 타입은 그대로 사용
                 
                 return (input_tensor, target_tensor)

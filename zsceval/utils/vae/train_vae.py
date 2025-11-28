@@ -433,8 +433,9 @@ def main():
     # VAE 생성
     vae_model = TemporalVAE(vae_config)
     
-    # Trainer (raw_image의 경우 BCE 사용)
-    use_bce = args.encoding in ['raw_image', 'OAI_raw_image']
+    # Trainer (raw_image 및 OAI_lossless의 경우 BCE 사용)
+    # OAI_lossless도 정규화된 데이터를 사용하므로 BCE loss가 더 적합
+    use_bce = args.encoding in ['raw_image', 'OAI_raw_image', 'OAI_lossless']
     
     # Wandb run 이름 자동 생성
     if args.use_wandb and args.wandb_run_name is None:

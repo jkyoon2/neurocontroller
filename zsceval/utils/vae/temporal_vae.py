@@ -365,8 +365,12 @@ class TemporalDecoder(nn.Module):
                 nn.AdaptiveAvgPool2d((h, w))
             )
         
-        # Raw image (RGB)의 경우 [0, 1] 범위를 위한 Sigmoid
-        self.use_sigmoid = (self.config.encoding_scheme == EncodingScheme.RAW_IMAGE)
+        # Raw image 및 OAI_lossless의 경우 [0, 1] 범위를 위한 Sigmoid
+        # OAI_lossless도 정규화된 데이터를 사용하므로 sigmoid 필요
+        self.use_sigmoid = (self.config.encoding_scheme in [
+            EncodingScheme.RAW_IMAGE, 
+            EncodingScheme.OAI_LOSSLESS
+        ])
     
     def _build_mlp_decoder(self):
         """Flatten된 출력을 생성하는 MLP Decoder"""
@@ -419,7 +423,8 @@ class TemporalDecoder(nn.Module):
                 # Deconvolution으로 upsampling
                 x_recon = self.deconv_layers(z_reshaped)
                 
-                # Raw image의 경우 Sigmoid로 [0, 1] 범위 보장
+                # Raw image 및 OAI_lossless의 경우 Sigmoid로 [0, 1] 범위 보장
+                # (데이터가 이미 0~1로 정규화되어 있고, BCE loss를 사용하므로)
                 if self.use_sigmoid:
                     x_recon = torch.sigmoid(x_recon)
                 else:
@@ -436,6 +441,10 @@ class TemporalDecoder(nn.Module):
                 x_recon = self.decoder_net(z)
                 # Reshape to (batch, k+1, *input_shape)
                 x_recon = x_recon.reshape(batch_size, self.k + 1, *self.config.input_shape)
+                
+                # MLP decoder의 경우도 sigmoid 적용 (OAI_lossless 등)
+                if self.use_sigmoid:
+                    x_recon = torch.sigmoid(x_recon)
         
         return x_recon
 
