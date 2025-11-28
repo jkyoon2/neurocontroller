@@ -82,6 +82,14 @@ def main():
     parser.add_argument('--wandb-run-name', type=str, default=None,
                        help='Wandb run 이름')
     
+    # Pos weight 설정
+    parser.add_argument('--use-pos-weight', action='store_true',
+                       help='Channel-wise pos_weight 사용 여부 (BCEWithLogitsLoss)')
+    parser.add_argument('--pos-weight-max', type=float, default=10.0,
+                       help='Pos_weight의 최댓값 (너무 큰 값 방지)')
+    parser.add_argument('--pos-weight-samples', type=int, default=10000,
+                       help='Pos_weight 계산에 사용할 최대 샘플 수')
+    
     args = parser.parse_args()
     
     torch.manual_seed(args.train_seed)
@@ -437,9 +445,53 @@ def main():
     # OAI_lossless도 정규화된 데이터를 사용하므로 BCE loss가 더 적합
     use_bce = args.encoding in ['raw_image', 'OAI_raw_image', 'OAI_lossless']
     
+    # Pos weight 계산 (use_bce이고 use_pos_weight가 True인 경우)
+    pos_weight = None
+    if use_bce and args.use_pos_weight:
+        print("\nCalculating pos_weights...")
+        # 데이터셋에서 샘플을 가져와서 채널 수 확인
+        if dataset is not None:
+            # Lazy dataset 사용
+            sample_input, sample_target = dataset[0]
+            if sample_target.ndim == 3:  # (k+1, C, H, W)
+                num_channels = sample_target.shape[1]
+            elif sample_target.ndim == 2:  # (k+1, feature_dim)
+                num_channels = sample_target.shape[1]
+            else:
+                num_channels = None
+            
+            if num_channels is not None:
+                # 임시 데이터로더 생성 (pos_weight 계산용)
+                from torch.utils.data import DataLoader
+                temp_loader = DataLoader(
+                    dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=0,  # Lazy loading과 함께 사용 시
+                    pin_memory=False
+                )
+                
+                from .temporal_vae_trainer import calculate_pos_weights
+                pos_weight = calculate_pos_weights(
+                    temp_loader,
+                    num_channels=num_channels,
+                    device=args.device,
+                    max_samples=args.pos_weight_samples,
+                    pos_weight_max=args.pos_weight_max
+                )
+                if pos_weight is not None:
+                    print(f"✓ Pos_weights calculated: shape={pos_weight.shape}")
+                else:
+                    print("⚠ Pos_weight calculation failed, continuing without pos_weight")
+        else:
+            print("⚠ Pos_weight calculation requires dataset (not buffer). Skipping...")
+    
     # Wandb run 이름 자동 생성
     if args.use_wandb and args.wandb_run_name is None:
-        args.wandb_run_name = f"vae_{args.encoding}_{args.mode}_h{args.hidden_dim}_k{args.k_timesteps}"
+        run_name = f"vae_{args.encoding}_{args.mode}_h{args.hidden_dim}_k{args.k_timesteps}"
+        if pos_weight is not None:
+            run_name += "_posw"
+        args.wandb_run_name = run_name
     
     trainer = TemporalVAETrainer(
         model=vae_model,
@@ -451,11 +503,15 @@ def main():
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         beta_warmup_steps=5000,
-        beta_annealing_steps=10000
+        beta_annealing_steps=10000,
+        pos_weight=pos_weight
     )
     
     if use_bce:
-        print("Using Binary Cross Entropy loss for image reconstruction")
+        if pos_weight is not None:
+            print("Using BCEWithLogitsLoss with channel-wise pos_weight for image reconstruction")
+        else:
+            print("Using Binary Cross Entropy loss for image reconstruction")
     
     # 학습
     print("\nTraining...")

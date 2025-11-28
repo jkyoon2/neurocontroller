@@ -367,10 +367,14 @@ class TemporalDecoder(nn.Module):
         
         # Raw image 및 OAI_lossless의 경우 [0, 1] 범위를 위한 Sigmoid
         # OAI_lossless도 정규화된 데이터를 사용하므로 sigmoid 필요
+        # 단, BCEWithLogitsLoss 사용 시에는 sigmoid를 제거해야 함
         self.use_sigmoid = (self.config.encoding_scheme in [
             EncodingScheme.RAW_IMAGE, 
             EncodingScheme.OAI_LOSSLESS
         ])
+        
+        # BCEWithLogitsLoss 사용 여부 (외부에서 설정 가능)
+        self.use_bce_with_logits = False
     
     def _build_mlp_decoder(self):
         """Flatten된 출력을 생성하는 MLP Decoder"""
@@ -423,9 +427,12 @@ class TemporalDecoder(nn.Module):
                 # Deconvolution으로 upsampling
                 x_recon = self.deconv_layers(z_reshaped)
                 
-                # Raw image 및 OAI_lossless의 경우 Sigmoid로 [0, 1] 범위 보장
-                # (데이터가 이미 0~1로 정규화되어 있고, BCE loss를 사용하므로)
-                if self.use_sigmoid:
+                # BCEWithLogitsLoss 사용 시: sigmoid 제거 (raw logit 반환)
+                # 일반 BCE 사용 시: sigmoid 적용하여 [0, 1] 범위 보장
+                if self.use_bce_with_logits:
+                    # sigmoid 제거 - raw logit 반환
+                    pass
+                elif self.use_sigmoid:
                     x_recon = torch.sigmoid(x_recon)
                 else:
                     # Sigmoid를 사용하지 않는 경우 Min-Max 정규화
@@ -442,8 +449,12 @@ class TemporalDecoder(nn.Module):
                 # Reshape to (batch, k+1, *input_shape)
                 x_recon = x_recon.reshape(batch_size, self.k + 1, *self.config.input_shape)
                 
-                # MLP decoder의 경우도 sigmoid 적용 (OAI_lossless 등)
-                if self.use_sigmoid:
+                # BCEWithLogitsLoss 사용 시: sigmoid 제거 (raw logit 반환)
+                # 일반 BCE 사용 시: sigmoid 적용하여 [0, 1] 범위 보장
+                if self.use_bce_with_logits:
+                    # sigmoid 제거 - raw logit 반환
+                    pass
+                elif self.use_sigmoid:
                     x_recon = torch.sigmoid(x_recon)
         
         return x_recon
@@ -552,26 +563,50 @@ def vae_loss(x_recon: torch.Tensor,
              mu: torch.Tensor,
              logvar: torch.Tensor,
              beta: float = 1.0,
-             use_bce: bool = False) -> Dict[str, torch.Tensor]:
+             use_bce: bool = False,
+             pos_weight: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
     """
     VAE loss 계산
     
     Args:
-        x_recon: Reconstructed observations
-        x_target: Target observations
+        x_recon: Reconstructed observations (logits if use_bce_with_logits, otherwise [0,1] range)
+        x_target: Target observations ([0, 1] 범위)
         mu: Latent mean
         logvar: Latent log variance
         beta: Weight for KL divergence term (β-VAE)
         use_bce: Binary Cross Entropy 사용 여부 (이미지의 경우 True 권장)
+        pos_weight: Channel-wise positive weights for BCEWithLogitsLoss (None이면 사용 안 함)
     
     Returns:
         Dictionary containing total loss and components
     """
     # Reconstruction loss
     if use_bce:
-        # Binary Cross Entropy (이미지 재구성에 적합)
-        # x_recon과 x_target 모두 [0, 1] 범위여야 함
-        recon_loss = F.binary_cross_entropy(x_recon, x_target, reduction='sum')
+        if pos_weight is not None:
+            # BCEWithLogitsLoss 사용 (pos_weight 적용)
+            # x_recon은 logits (sigmoid 통과 전), x_target은 [0, 1] 범위
+            # pos_weight shape: (C,) - 채널별 가중치
+            # x_recon shape: (batch, k+1, C, H, W) 또는 (batch, k+1, *obs_shape)
+            # pos_weight를 올바른 shape으로 확장해야 함
+            if x_recon.ndim == 5 and pos_weight.ndim == 1:
+                # (batch, k+1, C, H, W) 형태
+                # pos_weight를 (1, 1, C, 1, 1)로 확장
+                pos_weight_expanded = pos_weight.view(1, 1, -1, 1, 1)
+            elif x_recon.ndim == 3:
+                # Feature-based: pos_weight 사용 불가
+                pos_weight_expanded = None
+            else:
+                pos_weight_expanded = pos_weight
+            
+            if pos_weight_expanded is not None:
+                criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_expanded, reduction='sum')
+            else:
+                criterion = nn.BCEWithLogitsLoss(reduction='sum')
+            recon_loss = criterion(x_recon, x_target)
+        else:
+            # 기존 방식: Binary Cross Entropy (sigmoid가 이미 적용된 경우)
+            # x_recon과 x_target 모두 [0, 1] 범위여야 함
+            recon_loss = F.binary_cross_entropy(x_recon, x_target, reduction='sum')
     else:
         # Mean Squared Error (기본)
         recon_loss = F.mse_loss(x_recon, x_target, reduction='sum')

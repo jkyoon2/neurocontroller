@@ -35,6 +35,89 @@ from .temporal_vae import (
 )
 
 
+def calculate_pos_weights(data_loader: DataLoader, 
+                          num_channels: int,
+                          device: str = 'cpu',
+                          max_samples: Optional[int] = None,
+                          pos_weight_max: float = 50.0) -> torch.Tensor:
+    """
+    데이터 로더를 돌면서 채널별로 1(Positive)과 0(Negative)의 개수를 세어
+    pos_weight를 계산합니다.
+    
+    Args:
+        data_loader: 데이터 로더
+        num_channels: 채널 수 (예: 25)
+        device: 계산에 사용할 디바이스
+        max_samples: 최대 샘플 수 (None이면 전체 사용)
+        pos_weight_max: pos_weight의 최댓값 (너무 큰 값 방지)
+    
+    Returns:
+        pos_weights: (num_channels,) shape의 텐서 - 각 채널별 pos_weight
+    """
+    all_positives = torch.zeros(num_channels, device=device)
+    all_negatives = torch.zeros(num_channels, device=device)
+    
+    print("가중치 계산 중...")
+    num_batches = 0
+    
+    for batch_idx, (inputs, targets) in enumerate(tqdm(data_loader, desc="Calculating pos_weights")):
+        targets = targets.to(device)
+        
+        # 데이터 shape: (batch, k+1, C, H, W) 또는 (batch, k+1, *obs_shape)
+        # 채널 차원 찾기
+        if targets.ndim == 5:
+            # (batch, k+1, C, H, W) 형태
+            # 채널은 인덱스 2
+            # 0.5 기준으로 0/1 구분
+            targets_binary = (targets > 0.5).float()
+            
+            # 각 채널별로 1의 개수 합산
+            # (batch, k+1, C, H, W) -> (C,) - 채널별로 합산
+            pos = targets_binary.sum(dim=(0, 1, 3, 4))  # batch, time, height, width 차원 합산
+            
+            # 각 채널별 전체 픽셀 수
+            total_pixels = targets.size(0) * targets.size(1) * targets.size(3) * targets.size(4)
+            neg = total_pixels - pos
+            
+            all_positives += pos
+            all_negatives += neg
+        elif targets.ndim == 3:
+            # (batch, k+1, feature_dim) 형태 - feature-based encoding
+            # 채널 개념이 없으므로 전체에 대해 계산
+            targets_binary = (targets > 0.5).float()
+            pos = targets_binary.sum()
+            total_pixels = targets.numel()
+            neg = total_pixels - pos
+            
+            # feature-based는 채널별 가중치가 의미 없으므로 스킵
+            print("Warning: Feature-based encoding detected. Skipping channel-wise pos_weight calculation.")
+            return None
+        else:
+            print(f"Warning: Unexpected target shape: {targets.shape}. Skipping pos_weight calculation.")
+            return None
+        
+        num_batches += 1
+        
+        # 최대 샘플 수 제한
+        if max_samples is not None and num_batches * data_loader.batch_size >= max_samples:
+            break
+    
+    # 0으로 나누기 방지 (1e-6 더해줌)
+    pos_weights = all_negatives / (all_positives + 1e-6)
+    
+    # 너무 큰 값 제한 (Loss 폭발 방지)
+    pos_weights = torch.clamp(pos_weights, max=pos_weight_max)
+    
+    print(f"계산된 pos_weights (채널별):")
+    for i, weight in enumerate(pos_weights):
+        positives = all_positives[i].item()
+        negatives = all_negatives[i].item()
+        ratio = positives / (positives + negatives + 1e-6) if (positives + negatives) > 0 else 0.0
+        print(f"  Channel {i:2d}: pos_weight={weight:.2f} (pos={positives:.0f}, neg={negatives:.0f}, ratio={ratio:.4f})")
+    
+    return pos_weights
+
+
 class TemporalObservationBuffer:
     """
     시계열 관찰을 저장하고 관리하는 버퍼
@@ -219,7 +302,8 @@ class TemporalVAETrainer:
                  wandb_project: str = 'vae-training',
                  wandb_run_name: Optional[str] = None,
                  beta_warmup_steps: int = 5000,
-                 beta_annealing_steps: int = 10000):
+                 beta_annealing_steps: int = 10000,
+                 pos_weight: Optional[torch.Tensor] = None):
         """
         Args:
             model: TemporalVAE 모델
@@ -232,6 +316,7 @@ class TemporalVAETrainer:
             wandb_run_name: Wandb run 이름
             beta_warmup_steps: Beta warm-up 스텝 수 (이 스텝까지 beta=0으로 고정)
             beta_annealing_steps: Beta annealing 스텝 수 (warm-up 이후 이 스텝에 걸쳐 beta를 0에서 목표값까지 증가)
+            pos_weight: Channel-wise positive weights for BCEWithLogitsLoss (None이면 사용 안 함)
         """
         self.model = model.to(device)
         self.device = device
@@ -239,6 +324,14 @@ class TemporalVAETrainer:
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.use_bce = use_bce
         self.use_wandb = use_wandb
+        self.pos_weight = pos_weight.to(device) if pos_weight is not None else None
+        
+        # BCEWithLogitsLoss 사용 시 decoder에서 sigmoid 제거
+        if self.pos_weight is not None:
+            self.model.decoder.use_bce_with_logits = True
+            print("Using BCEWithLogitsLoss with channel-wise pos_weight")
+            print(f"  Pos_weight shape: {self.pos_weight.shape}")
+            print(f"  Pos_weight range: [{self.pos_weight.min().item():.2f}, {self.pos_weight.max().item():.2f}]")
         
         if self.checkpoint_dir:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -321,7 +414,8 @@ class TemporalVAETrainer:
             x_recon, mu, logvar = self.model(inputs)
             
             # Compute loss (annealed beta 사용)
-            losses = vae_loss(x_recon, targets, mu, logvar, beta=current_beta, use_bce=self.use_bce)
+            losses = vae_loss(x_recon, targets, mu, logvar, beta=current_beta, 
+                            use_bce=self.use_bce, pos_weight=self.pos_weight)
             
             self.global_step += 1
             
@@ -405,7 +499,8 @@ class TemporalVAETrainer:
             x_recon, mu, logvar = self.model(inputs)
             
             # Compute loss
-            losses = vae_loss(x_recon, targets, mu, logvar, beta=beta, use_bce=self.use_bce)
+            losses = vae_loss(x_recon, targets, mu, logvar, beta=beta, 
+                            use_bce=self.use_bce, pos_weight=self.pos_weight)
             
             # Accumulate losses
             for key in eval_losses:
@@ -474,6 +569,31 @@ class TemporalVAETrainer:
             num_workers=4,
             pin_memory=True
         )
+        
+        # pos_weight 계산 (use_bce이고 아직 계산되지 않은 경우)
+        if self.use_bce and self.pos_weight is None:
+            # 데이터 shape에서 채널 수 추출
+            sample_input, sample_target = train_dataset[0]
+            if sample_target.ndim == 3:  # (k+1, C, H, W)
+                num_channels = sample_target.shape[1]
+            elif sample_target.ndim == 2:  # (k+1, feature_dim)
+                num_channels = sample_target.shape[1]
+            else:
+                num_channels = None
+            
+            if num_channels is not None:
+                print(f"\nCalculating pos_weights for {num_channels} channels...")
+                pos_weights = calculate_pos_weights(
+                    train_loader, 
+                    num_channels=num_channels,
+                    device=self.device,
+                    max_samples=10000,  # 최대 10,000 샘플로 계산 (빠른 계산)
+                    pos_weight_max=50.0
+                )
+                if pos_weights is not None:
+                    self.pos_weight = pos_weights
+                    self.model.decoder.use_bce_with_logits = True
+                    print("✓ Pos_weights calculated and applied")
         
         # Early stopping setup
         best_val_loss = float('inf')
@@ -574,6 +694,31 @@ class TemporalVAETrainer:
             num_workers=0,  # Lazy loading과 함께 사용 시 메모리 중복 방지
             pin_memory=False  # 메모리 절약
         )
+        
+        # pos_weight 계산 (use_bce이고 아직 계산되지 않은 경우)
+        if self.use_bce and self.pos_weight is None:
+            # 데이터 shape에서 채널 수 추출
+            sample_input, sample_target = dataset[0]
+            if sample_target.ndim == 3:  # (k+1, C, H, W)
+                num_channels = sample_target.shape[1]
+            elif sample_target.ndim == 2:  # (k+1, feature_dim)
+                num_channels = sample_target.shape[1]
+            else:
+                num_channels = None
+            
+            if num_channels is not None:
+                print(f"\nCalculating pos_weights for {num_channels} channels...")
+                pos_weights = calculate_pos_weights(
+                    train_loader, 
+                    num_channels=num_channels,
+                    device=self.device,
+                    max_samples=10000,  # 최대 10,000 샘플로 계산 (빠른 계산)
+                    pos_weight_max=50.0
+                )
+                if pos_weights is not None:
+                    self.pos_weight = pos_weights
+                    self.model.decoder.use_bce_with_logits = True
+                    print("✓ Pos_weights calculated and applied")
         
         # Early stopping setup
         best_val_loss = float('inf')
